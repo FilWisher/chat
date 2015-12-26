@@ -1,27 +1,27 @@
-/*
-    dial client
-    
-    listen for incoming    
-    
-    take input from command line and write to clientOut
-    
-    when message received, listen to addr if not already
-
-    serialize and deserialize message
-*/
 package main
 
 import (
   "log"
   "encoding/gob"
-  "bytes"
   "fmt"
   "net"
   "io"
   "bufio"
   "os"
   "strings"
+  "math/rand"
+  "time"
+  "github.com/filwisher/utils/extip"
 )
+
+func GUID(n int) string {
+  var letters = []rune("abcdef0123456789")
+  b := make([]rune, n)
+  for i := range b {
+    b[i] = letters[rand.Intn(len(letters))]
+  }
+  return string(b)
+}
 
 type Peer struct {
   ChannOut chan Message
@@ -32,25 +32,18 @@ type Peer struct {
 type Message struct {
   Body string
   Addr string
+  ID string
 }
 
 var (
   arrivers = make(chan Peer)
   leavers = make(chan Peer)
   messages = make(chan Message)
+  peers = make(map[string]Peer)
+  received = make(map[string]bool)
 )
 
-func (m Message) GobEncode() ([]byte, error) {
-  var b bytes.Buffer
-  fmt.Fprintln(&b, m.Body, m.Addr)
-  return b.Bytes(), nil
-}
-
-func (m *Message) GobDecode(data []byte) error {
-  b := bytes.NewBuffer(data)
-  _, err := fmt.Fscanln(b, &m.Body, &m.Addr)
-  return err
-}
+var id string
 
 func writeTo(ch chan Message, conn net.Conn) {
   enc := gob.NewEncoder(conn)
@@ -65,14 +58,26 @@ func readFrom(ch chan Message, conn net.Conn, end chan bool) {
   var msg Message
   for {
     err := dec.Decode(&msg)
-    /* TODO: this logic makes spaces not correct */
-    /*      likely because of decoding and encoding */
     if err != nil {
       if err == io.EOF {
         end <- true
         break
       }
+      log.Println(err)
+      continue
     }
+    _, ok := received[msg.ID]
+    if ok {
+      return
+    }
+    select {
+    case messages <- msg:
+      //
+    default:
+      //
+    }
+    received[msg.ID] = true
+
     fmt.Println(msg.Addr + ": " + msg.Body)
   }
 }
@@ -91,7 +96,7 @@ func connect(address string) {
   var peer Peer
   peer.ChannOut = make(chan Message)
   peer.ChannIn = make(chan Message)
-  peer.Addr = conn.RemoteAddr().String()
+  peer.Addr = address
 
   arrivers <- peer
 
@@ -100,25 +105,32 @@ func connect(address string) {
 
   <-end
 
-  fmt.Println("closin now")
   leavers <- peer
   conn.Close()
 }
 
 func managePeers() {
-  peers := make(map[Peer]string)
 
   for {
     select {
       case peer := <-arrivers:
-        peers[peer] = peer.Addr
+        peers[peer.Addr] = peer
+        fmt.Println("peers::::")
+        fmt.Println(peers)
       case peer := <-leavers:
         close(peer.ChannOut)
         close(peer.ChannIn)
-        delete(peers, peer)
+        delete(peers, peer.Addr)
       case msg := <-messages:
-        for peer := range peers {
-          peer.ChannOut <- msg
+        _, ok := peers[msg.Addr]
+        if !ok && msg.Addr != id {
+          fmt.Println("not exists")
+          go connect(msg.Addr)
+        }
+        for _, peer := range peers {
+          if peer.Addr != msg.Addr {
+            peer.ChannOut <- msg
+          }
         }
     }
   }
@@ -174,6 +186,11 @@ func runCommand(msg Message) {
     go connect(args[1])
   case "/info":
     fmt.Println(msg.Addr)
+  case "/peers":
+    for addr, peer := range(peers) {
+      fmt.Printf(addr)
+      fmt.Println(peer)
+    }
   default:
     messages <- msg
   }
@@ -181,15 +198,17 @@ func runCommand(msg Message) {
 
 func init() {
   log.SetFlags(log.LstdFlags | log.Lshortfile)
+  rand.Seed(time.Now().UnixNano())
 }
 
 func main() {
 
-  l, err := net.Listen("tcp", "localhost" + ":0")
+  l, err := net.Listen("tcp", extip.Extip() + ":0")
   if err != nil {
     log.Fatal(err)
   }
-  fmt.Printf("listening on %s\n", l.Addr().String())
+  id = l.Addr().String()
+  fmt.Printf("listening on %s\n", id)
   go managePeers()
   go listen(l)
 
@@ -200,7 +219,8 @@ func main() {
       fmt.Println(err)
       continue
     }
-    msg := Message{scanner.Text(), l.Addr().String()}
+    msg := Message{scanner.Text(), id, GUID(9)}
+    received[msg.ID] = true
     go runCommand(msg)
   }
 }
