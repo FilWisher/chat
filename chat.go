@@ -1,21 +1,34 @@
+// TODO: migrate to messages and decode/encode
+
 package main
 
 import (
-  "log"
-  "encoding/gob"
-  "fmt"
   "net"
-  "io"
+  "fmt"
   "bufio"
   "os"
+  "encoding/gob"
   "strings"
   "math/rand"
   "time"
-  "github.com/filwisher/utils/extip"
 )
 
-func GUID(n int) string {
-  var letters = []rune("abcdef0123456789")
+var (
+  ID, Name string
+)
+
+type Message struct {
+  Text, ID, Sender, Name string
+}
+
+var (
+  send = make(chan Message)
+  conns = make(map[*gob.Encoder]bool)
+  had = make(map[string]bool)
+)
+
+func id(n int) string {
+  letters := []rune("abcdef0123456789")
   b := make([]rune, n)
   for i := range b {
     b[i] = letters[rand.Intn(len(letters))]
@@ -23,204 +36,117 @@ func GUID(n int) string {
   return string(b)
 }
 
-type Peer struct {
-  ChannOut chan Message
-  ChannIn chan Message
-  Addr string
+func broadcastMessage(text string) {
+  msg := Message{text, id(7), ID, Name}
+  send <- msg
 }
 
-type Message struct {
-  Body string
-  Addr string
-  ID string
+func connect (address string) {
+  conn, err := net.Dial("tcp", address)
+  if err != nil {
+    fmt.Println("couldn't connect")
+    return
+  }
+  fmt.Printf("connecting to %s\n", address)
+  handle(conn)
 }
 
-var (
-  arrivers = make(chan Peer)
-  leavers = make(chan Peer)
-  messages = make(chan Message)
-  peers = make(map[string]Peer)
-  received = make(map[string]bool)
-)
-
-var id string
-
-func writeTo(ch chan Message, conn net.Conn) {
-  enc := gob.NewEncoder(conn)
-  for {
-    msg := <-ch
-    enc.Encode(msg)
+func runCommand(command string) {
+  args := strings.Split(command, " ")
+  switch args[0] {
+  case "/connect":
+    if len(args) < 2 {
+      fmt.Println("Not enough args")
+      return
+    }
+    go connect(args[1])
+  default:
+    fmt.Println("I didn't recognize that")
   }
 }
 
-func readFrom(ch chan Message, conn net.Conn, end chan bool) {
-  dec := gob.NewDecoder(conn)
+func readStdin() {
+  sc := bufio.NewScanner(os.Stdin)
+  for sc.Scan() {
+    if err := sc.Err(); err != nil {
+      continue
+    }
+    input := sc.Text()
+    if string(input[0]) == "/" {
+      go runCommand(input)
+    } else {
+      go broadcastMessage(input)
+    }
+  }
+}
+
+func getMessage(dec *gob.Decoder, fn func (Message)) {
   var msg Message
   for {
     err := dec.Decode(&msg)
     if err != nil {
-      if err == io.EOF {
-        end <- true
-        break
-      }
-      log.Println(err)
-      continue
-    }
-    _, ok := received[msg.ID]
-    if ok {
+      fmt.Println("err")
       return
     }
-    select {
-    case messages <- msg:
-      //
-    default:
-      //
+    _, ok := had[msg.ID]
+    had[msg.ID] = true
+    if !ok && msg.Sender != ID {
+      fn(msg)
     }
-    received[msg.ID] = true
-
-    fmt.Println(msg.Addr + ": " + msg.Body)
   }
 }
 
-func connect(address string) {
-
-  fmt.Printf("Connecting to %s\n", address)
-  end := make(chan bool)
-
-  conn, err := net.Dial("tcp", address)
-  if err != nil {
-    log.Println(err)
-    return
-  }
-
-  var peer Peer
-  peer.ChannOut = make(chan Message)
-  peer.ChannIn = make(chan Message)
-  peer.Addr = address
-
-  arrivers <- peer
-
-  go writeTo(peer.ChannOut, conn)
-  go readFrom(peer.ChannIn, conn, end)
-
-  <-end
-
-  leavers <- peer
-  conn.Close()
-}
-
-func managePeers() {
-
+func writeToConns() {
   for {
-    select {
-      case peer := <-arrivers:
-        peers[peer.Addr] = peer
-        fmt.Println("peers::::")
-        fmt.Println(peers)
-      case peer := <-leavers:
-        close(peer.ChannOut)
-        close(peer.ChannIn)
-        delete(peers, peer.Addr)
-      case msg := <-messages:
-        _, ok := peers[msg.Addr]
-        if !ok && msg.Addr != id {
-          fmt.Println("not exists")
-          go connect(msg.Addr)
-        }
-        for _, peer := range peers {
-          if peer.Addr != msg.Addr {
-            peer.ChannOut <- msg
-          }
-        }
+    msg := <-send
+    for enc := range(conns) {
+      enc.Encode(msg)
     }
   }
 }
 
-func handleConnection(conn net.Conn) {
-
-  end := make(chan bool)
-
-  var peer Peer
-  peer.ChannOut = make(chan Message, 2)
-  peer.ChannIn = make(chan Message, 2)
-  peer.Addr = conn.RemoteAddr().String()
-
-  fmt.Printf("now connected to %s\n", conn.RemoteAddr().String())
-
-  arrivers <- peer
-
-  go writeTo(peer.ChannOut, conn)
-  go readFrom(peer.ChannIn, conn, end)
-
-  <-end
-
-  leavers <- peer
-  conn.Close()
-
-}
-
-func listen(l net.Listener) {
-  for {
-    conn, err := l.Accept()
-    if err != nil {
-      log.Println(err)
-      continue
-    }
-    go handleConnection(conn)
-  }
-}
-
-func isLongEnough(args []string, length int) bool {
-  return len(args) >= length
-}
-
-/* define irc-like commands */
-func runCommand(msg Message) {
-  args := strings.Split(msg.Body, " ")
-  switch args[0] {
-  case "/connect":
-    if !isLongEnough(args, 2) {
-      log.Println("Not enough arguments")
-      return
-    }
-    go connect(args[1])
-  case "/info":
-    fmt.Println(msg.Addr)
-  case "/peers":
-    for addr, peer := range(peers) {
-      fmt.Printf(addr)
-      fmt.Println(peer)
-    }
-  default:
-    messages <- msg
-  }
+func handle(conn net.Conn) {
+  enc := gob.NewEncoder(conn)
+  dec := gob.NewDecoder(conn)
+  conns[enc] = true
+  getMessage(dec, func (msg Message) {
+    fmt.Printf("%s: %s\n", msg.Name, msg.Text)
+    send <- msg
+  })
+  delete(conns, enc)
 }
 
 func init() {
-  log.SetFlags(log.LstdFlags | log.Lshortfile)
   rand.Seed(time.Now().UnixNano())
+  ID = id(10)
+}
+
+func getName() string {
+  fmt.Println("What is your name?")
+  scanner := bufio.NewScanner(os.Stdin)
+  scanner.Scan()
+  if err := scanner.Err(); err != nil {
+    panic("name not working")
+  }
+  return scanner.Text()
 }
 
 func main() {
 
-  l, err := net.Listen("tcp", extip.Extip() + ":0")
-  if err != nil {
-    log.Fatal(err)
-  }
-  id = l.Addr().String()
-  fmt.Printf("listening on %s\n", id)
-  go managePeers()
-  go listen(l)
+  l, _ := net.Listen("tcp", "localhost:0")
+  fmt.Printf("listening on %s\n", l.Addr().String())
 
-  scanner := bufio.NewScanner(os.Stdin)
+  Name = getName()
 
-  for scanner.Scan() {
-    if err = scanner.Err(); err != nil {
-      fmt.Println(err)
+  go readStdin()
+  go writeToConns()
+
+  for {
+    conn, err := l.Accept()
+    if err != nil {
       continue
     }
-    msg := Message{scanner.Text(), id, GUID(9)}
-    received[msg.ID] = true
-    go runCommand(msg)
+    fmt.Printf("received conn from %s\n", conn.RemoteAddr().String())
+    go handle(conn)
   }
 }
